@@ -1,3 +1,5 @@
+import hashlib
+import time
 import requests
 import json
 import os
@@ -9,6 +11,12 @@ from pypushdeer import PushDeer
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging_config import init_logger
+
+# GLaDOS 自 2026-11-04 起给签到接口加了一次性人机验证（challenge）：
+# 必须先取 nonce、按官网算法算出 proof、等待规定时间后再提交。
+# 缺少该验证时服务端只发放保底 1 分。
+CHECKIN_CHALLENGE_DELAY = 2.5
+CHECKIN_CHALLENGE_SALT = ".glados-observe-v1"
 
 
 class CheckinStatus(Enum):
@@ -283,15 +291,67 @@ class API:
         """获取签到数据"""
         return {"token": self.domain}
 
+    def _fetch_checkin_challenge(self, cookies: str, user_agent: Optional[str] = None) -> Optional[Dict]:
+        """获取一次性签到验证（GLaDOS 专用，失败返回 None）"""
+        url = self._get_full_url("/api/user/checkin/challenge")
+        response = self._make_request(url, "GET", cookies=cookies, user_agent=user_agent)
+        if not response:
+            return None
+
+        try:
+            data = response.json()
+        except ValueError:
+            self._log("warning", LogEmoji.WARNING, "签到验证响应解析失败", force=True)
+            return None
+
+        if data.get("code") != 0:
+            self._log("warning", LogEmoji.WARNING, f"签到验证获取失败: {data.get('message', data)}", force=True)
+            return None
+
+        nonce = data.get("nonce")
+        ttl = data.get("ttl", 300000)
+        if not isinstance(nonce, str) or not nonce or len(nonce) > 4096:
+            self._log("warning", LogEmoji.WARNING, "签到验证 nonce 无效", force=True)
+            return None
+        if not isinstance(ttl, (int, float)) or ttl <= CHECKIN_CHALLENGE_DELAY * 1000:
+            self._log("warning", LogEmoji.WARNING, f"签到验证有效期异常: {ttl}", force=True)
+            return None
+
+        return {"nonce": nonce, "ttl": ttl}
+
+    def _build_checkin_data(self, cookies: str, user_agent: Optional[str] = None) -> Dict[str, str]:
+        """构造签到请求体；GLaDOS 需先取 challenge 再计算 proof"""
+        data = self._get_checkin_data()
+
+        # Railgun 等站点没有 challenge 机制，保持原样
+        if "glados" not in self.domain:
+            return data
+
+        challenge = self._fetch_checkin_challenge(cookies, user_agent)
+        if not challenge:
+            # 取不到验证时退回旧流程：服务端按保底分处理，至少不会断签
+            self._log("warning", LogEmoji.WARNING, "未取得签到验证，回退为普通提交（可能仅获保底分）", force=True)
+            return data
+
+        nonce = challenge["nonce"]
+        proof = hashlib.sha256((nonce + CHECKIN_CHALLENGE_SALT).encode("utf-8")).hexdigest()
+        # 官网要求验证签发后等待一段时间再提交
+        time.sleep(CHECKIN_CHALLENGE_DELAY)
+
+        data = dict(data)
+        data["nonce"] = nonce
+        data["proof"] = proof
+        return data
+
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
         """执行签到，含设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
-        checkin_data = self._get_checkin_data()
 
         # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
         start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
 
+        checkin_data = self._build_checkin_data(cookies, start_ua)
         raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
 
         # 设备不匹配(code 4)时按服务端 loginDevice 切换 UA 重试一次
@@ -300,6 +360,8 @@ class API:
             recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
             if recover_ua and recover_ua != start_ua:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
+                # 验证是一次性的，重试需重新获取
+                checkin_data = self._build_checkin_data(cookies, recover_ua)
                 raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
 
         return self._parse_checkin(raw)
